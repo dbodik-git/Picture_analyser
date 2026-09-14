@@ -1,7 +1,7 @@
 """
 Сравнение двух изображений: MSE, SSIM, корреляция гистограмм
 и визуальная карта различий.
-
+ ***********************************
 Запуск:
     python compare.py image1.jpg image2.jpg
     python compare.py image1.jpg image2.jpg --no-show --save-diff diff.png
