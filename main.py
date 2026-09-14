@@ -6,12 +6,13 @@ Picture Analyser — анализ и сравнение изображений.
     • технические характеристики: размер, aspect ratio, яркость,
       контраст, насыщенность, резкость, clipping;
     • анализ серии BASE/rank-вариантов относительно BASE;
+    • visual stability score и поиск резкого падения между rank;
     • карта различий и удобная текстовая таблица для копирования.
 
 Примеры:
     python main.py image1.png image2.png
     python main.py image1.png image2.png --no-show --save-diff diff.png
-    python main.py --folder ./test --no-show
+    python main.py series ./test
 
 Для пакетного режима имена файлов должны содержать BASE и/или rank,
 например: BASE.png, r32.png, r24.png, r16.png, r8.png.
@@ -20,6 +21,7 @@ Picture Analyser — анализ и сравнение изображений.
 from __future__ import annotations
 
 import argparse
+import math
 import re
 import sys
 from pathlib import Path
@@ -69,7 +71,7 @@ def ssim_map(gray1: np.ndarray, gray2: np.ndarray) -> tuple[float, np.ndarray]:
 
 
 def hist_correlation(img1: np.ndarray, img2: np.ndarray) -> float:
-    """Корреляция 3D-гистограмм RGB/BGR (8x8x8 бинов)."""
+    """Корреляция 3D-гистограмм BGR (8x8x8 бинов)."""
     hist1 = cv2.calcHist([img1], [0, 1, 2], None, [8, 8, 8], [0, 256] * 3)
     hist2 = cv2.calcHist([img2], [0, 1, 2], None, [8, 8, 8], [0, 256] * 3)
     cv2.normalize(hist1, hist1, alpha=1.0, norm_type=cv2.NORM_L1)
@@ -89,8 +91,6 @@ def image_stats(img: np.ndarray) -> dict[str, float | int | str]:
     brightness = float(np.mean(gray))
     contrast = float(np.std(gray))
     saturation = float(np.mean(hsv[:, :, 1]))
-
-    # Variance of Laplacian — простой и быстрый индикатор микрорезкости.
     sharpness = float(cv2.Laplacian(gray, cv2.CV_64F).var())
 
     total = gray.size
@@ -113,14 +113,14 @@ def image_stats(img: np.ndarray) -> dict[str, float | int | str]:
 def format_stats(stats: dict[str, float | int | str]) -> str:
     """Красивый текстовый вывод характеристик."""
     return (
-        f"  Размер:              {stats['width']} x {stats['height']}\n"
-        f"  Aspect ratio:        {stats['aspect_ratio']:.4f}\n"
-        f"  Яркость:             {stats['brightness']:.2f}\n"
-        f"  Контраст:            {stats['contrast']:.2f}\n"
-        f"  Насыщенность:        {stats['saturation']:.2f}\n"
+        f"  Размер:               {stats['width']} x {stats['height']}\n"
+        f"  Aspect ratio:         {stats['aspect_ratio']:.4f}\n"
+        f"  Яркость:              {stats['brightness']:.2f}\n"
+        f"  Контраст:             {stats['contrast']:.2f}\n"
+        f"  Насыщенность:         {stats['saturation']:.2f}\n"
         f"  Резкость (Laplacian): {stats['sharpness']:.2f}\n"
-        f"  Чёрный clipping:     {stats['dark_clip_pct']:.2f}%\n"
-        f"  Белый clipping:      {stats['bright_clip_pct']:.2f}%"
+        f"  Чёрный clipping:      {stats['dark_clip_pct']:.2f}%\n"
+        f"  Белый clipping:       {stats['bright_clip_pct']:.2f}%"
     )
 
 
@@ -204,7 +204,7 @@ def side_by_side(
 
 
 def verdict_from_ssim(ssim_value: float) -> str:
-    """Человеческая интерпретация SSIM; это НЕ оценка качества изображения."""
+    """Интерпретация SSIM; это НЕ оценка художественного качества."""
     if ssim_value > 0.95:
         return "очень похожи"
     if ssim_value > 0.80:
@@ -220,6 +220,76 @@ def signed_delta(value: float, base: float) -> tuple[float, float]:
     if base == 0:
         return delta, 0.0
     return delta, delta / abs(base) * 100.0
+
+
+def visual_stability_score(
+    ssim_value: float,
+    hist_value: float,
+    sharpness_delta_pct: float,
+) -> float:
+    """Сводный индикатор стабильности относительно BASE.
+
+    Это эвристика для сортировки вариантов, а не объективная оценка качества.
+    SSIM имеет основной вес, цветовая гистограмма — меньший, а изменение
+    резкости мягко штрафуется в обе стороны.
+    """
+    ssim_component = float(np.clip(ssim_value, 0.0, 1.0))
+    hist_component = float(np.clip((hist_value + 1.0) / 2.0, 0.0, 1.0))
+    sharp_component = math.exp(-abs(sharpness_delta_pct) / 100.0)
+    score = 100.0 * (
+        0.60 * ssim_component
+        + 0.25 * hist_component
+        + 0.15 * sharp_component
+    )
+    return float(np.clip(score, 0.0, 100.0))
+
+
+def stability_label(score: float) -> str:
+    """Человеческая метка для эвристического stability score."""
+    if score >= 90.0:
+        return "STABLE"
+    if score >= 80.0:
+        return "GOOD"
+    if score >= 70.0:
+        return "WATCH"
+    return "WARNING"
+
+
+def analyse_rank_stability(rows: list[dict]) -> dict:
+    """Найти возможный quality cliff между соседними rank.
+
+    Анализируется только фактически присутствующая серия. Никакие отсутствующие
+    rank не считаются стабильными автоматически.
+    """
+    ranked = sorted(
+        (row for row in rows if row.get("rank") is not None),
+        key=lambda row: int(row["rank"]),
+        reverse=True,
+    )
+
+    cliffs: list[dict] = []
+    for high, low in zip(ranked, ranked[1:]):
+        drop = float(high["stability_score"]) - float(low["stability_score"])
+        if drop >= 8.0:
+            cliffs.append({
+                "from_rank": int(high["rank"]),
+                "to_rank": int(low["rank"]),
+                "score_drop": drop,
+            })
+
+    stable_candidates = [
+        row for row in ranked
+        if float(row["stability_score"]) >= 80.0
+    ]
+
+    minimum_stable_rank = None
+    if stable_candidates:
+        minimum_stable_rank = min(int(row["rank"]) for row in stable_candidates)
+
+    return {
+        "cliffs": cliffs,
+        "minimum_stable_rank": minimum_stable_rank,
+    }
 
 
 def compare(
@@ -251,23 +321,28 @@ def compare(
     stats1 = image_stats(img1)
     stats2 = image_stats(img2)
 
+    _, sharp_pct = signed_delta(float(stats2["sharpness"]), float(stats1["sharpness"]))
+    stability = visual_stability_score(ssim_val, hist_val, sharp_pct)
+
     results = {
         "mse_gray": mse_val,
         "mse_color": color_mse_val,
         "ssim": ssim_val,
         "hist_correlation": hist_val,
+        "stability_score": stability,
         "identical": bool(np.array_equal(img1, img2)),
         "stats1": stats1,
         "stats2": stats2,
     }
 
-    print("=" * 64)
+    print("=" * 70)
     print(f"  {Path(path1).name}  vs  {Path(path2).name}")
-    print("=" * 64)
+    print("=" * 70)
     print(f"  Gray MSE:                                      {mse_val:12.2f}")
     print(f"  Color MSE:                                     {color_mse_val:12.2f}")
     print(f"  SSIM:                                           {ssim_val:12.4f}")
     print(f"  Корреляция гистограмм:                         {hist_val:12.4f}")
+    print(f"  Visual stability score:                        {stability:12.2f}/100")
 
     print("\n  Характеристики Image 1:")
     print(format_stats(stats1))
@@ -291,7 +366,8 @@ def compare(
     else:
         print(f"\n  Вывод по SSIM: изображения {verdict_from_ssim(ssim_val)}")
         print("  ⚠ SSIM — метрика сходства, а не универсальная оценка качества.")
-    print("=" * 64)
+        print("  ℹ Stability score — эвристика для сравнения вариантов, не оценка искусства.")
+    print("=" * 70)
 
     if save_diff:
         output = Path(save_diff)
@@ -334,7 +410,15 @@ def is_base_name(path: Path) -> bool:
 
 def collect_images(folder: str | Path) -> list[Path]:
     """Собрать изображения из папки, отсортировав BASE, затем rank по убыванию."""
-    paths = [p for p in Path(folder).iterdir() if p.is_file() and p.suffix.lower() in IMAGE_EXTENSIONS]
+    folder_path = Path(folder)
+    if not folder_path.is_dir():
+        print(f"[!] Папка не найдена: {folder}", file=sys.stderr)
+        return []
+
+    paths = [
+        p for p in folder_path.iterdir()
+        if p.is_file() and p.suffix.lower() in IMAGE_EXTENSIONS
+    ]
 
     def sort_key(path: Path) -> tuple[int, int, str]:
         if is_base_name(path):
@@ -351,7 +435,6 @@ def analyse_series(folder: str | Path, resize_to: str = "first") -> list[dict]:
     """Сравнить все rank-варианты в папке с BASE."""
     paths = collect_images(folder)
     if not paths:
-        print(f"[!] В папке нет поддерживаемых изображений: {folder}", file=sys.stderr)
         return []
 
     base = next((path for path in paths if is_base_name(path)), paths[0])
@@ -360,16 +443,16 @@ def analyse_series(folder: str | Path, resize_to: str = "first") -> list[dict]:
         return []
 
     base_stats = image_stats(base_img)
-    print("=" * 96)
+    print("=" * 118)
     print(f"  SERIES ANALYSIS: {Path(folder).resolve()}")
     print(f"  BASE: {base.name}")
     print("  Все метрики ниже сравнивают вариант с BASE.")
-    print("=" * 96)
+    print("=" * 118)
     print(
         f"  {'Variant':24s} {'Rank':>5s} {'SSIM':>8s} {'Hist':>8s} "
-        f"{'Sharp Δ':>10s} {'Bright Δ':>10s} {'Contrast Δ':>11s}"
+        f"{'Sharp Δ':>10s} {'Bright Δ':>10s} {'Contrast Δ':>11s} {'Stable':>9s} {'Flag':>8s}"
     )
-    print("-" * 96)
+    print("-" * 118)
 
     rows: list[dict] = []
     for path in paths:
@@ -394,12 +477,15 @@ def analyse_series(folder: str | Path, resize_to: str = "first") -> list[dict]:
         _, sharp_pct = signed_delta(float(stats["sharpness"]), float(base_stats["sharpness"]))
         _, bright_pct = signed_delta(float(stats["brightness"]), float(base_stats["brightness"]))
         _, contrast_pct = signed_delta(float(stats["contrast"]), float(base_stats["contrast"]))
+        stability = visual_stability_score(ssim_value, hist_value, sharp_pct)
 
         rank = rank_from_name(path)
         rank_text = str(rank) if rank is not None else "-"
+        label = stability_label(stability)
         print(
             f"  {path.stem[:24]:24s} {rank_text:>5s} {ssim_value:8.4f} "
-            f"{hist_value:8.4f} {sharp_pct:+9.2f}% {bright_pct:+9.2f}% {contrast_pct:+10.2f}%"
+            f"{hist_value:8.4f} {sharp_pct:+9.2f}% {bright_pct:+9.2f}% "
+            f"{contrast_pct:+10.2f}% {stability:8.2f} {label:>8s}"
         )
 
         rows.append({
@@ -411,11 +497,35 @@ def analyse_series(folder: str | Path, resize_to: str = "first") -> list[dict]:
             "sharpness_delta_pct": sharp_pct,
             "brightness_delta_pct": bright_pct,
             "contrast_delta_pct": contrast_pct,
+            "stability_score": stability,
+            "stability_label": label,
         })
 
-    print("-" * 96)
-    print("  ⚠ SSIM/Hist показывают сходство с BASE; это не рейтинг художественного качества.")
-    print("=" * 96)
+    analysis = analyse_rank_stability(rows)
+
+    print("-" * 118)
+    if analysis["cliffs"]:
+        print("  ⚠ QUALITY CLIFF: резкое падение stability score между:")
+        for cliff in analysis["cliffs"]:
+            print(
+                f"      r{cliff['from_rank']} → r{cliff['to_rank']}: "
+                f"-{cliff['score_drop']:.2f} points"
+            )
+    else:
+        print("  ✓ Резкого quality cliff среди присутствующих rank не обнаружено.")
+
+    if analysis["minimum_stable_rank"] is not None:
+        print(
+            f"  ★ Минимальный стабильный rank по этой эвристике: "
+            f"r{analysis['minimum_stable_rank']}"
+        )
+    else:
+        print("  ⚠ Ни один присутствующий rank не достиг stability score 80/100.")
+
+    print("  ℹ Stable ≥90, Good ≥80, Watch ≥70; это эвристические пороги.")
+    print("  ℹ SSIM/Hist показывают сходство с BASE; это не рейтинг художественного качества.")
+    print("  ℹ Stability score помогает сортировать варианты, но финальное решение делаем по A/B-картинкам.")
+    print("=" * 118)
     return rows
 
 
