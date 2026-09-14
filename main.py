@@ -1,49 +1,77 @@
 """
-Сравнение двух изображений: MSE, SSIM, корреляция гистограмм
-и визуальная карта различий.
- ***********************************
-Запуск:
-    python compare.py image1.jpg image2.jpg
-    python compare.py image1.jpg image2.jpg --no-show --save-diff diff.png
+Picture Analyser — анализ и сравнение изображений.
+
+Возможности:
+    • сравнение двух изображений: MSE, SSIM, корреляция гистограмм;
+    • технические характеристики: размер, aspect ratio, яркость,
+      контраст, насыщенность, резкость, clipping;
+    • анализ серии BASE/rank-вариантов относительно BASE;
+    • visual stability score и поиск резкого падения между rank;
+    • карта различий и удобная текстовая таблица для копирования.
+
+Примеры:
+    python main.py image1.png image2.png
+    python main.py image1.png image2.png --no-show --save-diff diff.png
+    python main.py series ./test
+
+Для пакетного режима имена файлов должны содержать BASE и/или rank,
+например: BASE.png, r32.png, r24.png, r16.png, r8.png.
 """
 
+from __future__ import annotations
+
 import argparse
+import math
+import re
 import sys
 from pathlib import Path
 
 import cv2
 import numpy as np
-from skimage.metrics import structural_similarity as ssim
+from skimage.metrics import structural_similarity as structural_ssim
 
 
 # ---------- Загрузка ----------
 
-def load_image(path: str) -> np.ndarray | None:
-    """Загружает изображение, приводя его к 3-канальному BGR."""
-    # IMREAD_COLOR отбрасывает альфа-канал (проблема с PNG решена)
-    img = cv2.imread(path, cv2.IMREAD_COLOR)
+
+def load_image(path: str | Path) -> np.ndarray | None:
+    """Загрузить изображение как 3-канальный BGR."""
+    img = cv2.imread(str(path), cv2.IMREAD_COLOR)
     if img is None:
         print(f"[!] Не удалось загрузить: {path}", file=sys.stderr)
     return img
 
 
-# ---------- Метрики ----------
+# ---------- Базовые метрики ----------
+
 
 def mse(a: np.ndarray, b: np.ndarray) -> float:
-    """MSE на float32 — быстрее и без переполнения."""
-    diff = a.astype(np.float32) - b.astype(np.float32)
+    """Mean Squared Error. Меньше = ближе."""
+    a32 = a.astype(np.float32)
+    b32 = b.astype(np.float32)
+    diff = a32 - b32
     return float(np.mean(diff * diff))
 
 
-def ssim_map(gray1: np.ndarray, gray2: np.ndarray):
-    """SSIM + карта. Возвращаем и значение, и карту различий (1 = различие)."""
-    score, sim_map = ssim(gray1, gray2, full=True, data_range=255)
-    diff_map = ((1.0 - sim_map) * 255).astype(np.uint8)  # инвертируем!
+def gray_mse(a: np.ndarray, b: np.ndarray) -> float:
+    """MSE для изображений в градациях серого."""
+    return mse(a, b)
+
+
+def ssim_map(gray1: np.ndarray, gray2: np.ndarray) -> tuple[float, np.ndarray]:
+    """SSIM и карта различий, где 255 означает сильное различие."""
+    score, similarity_map = structural_ssim(
+        gray1,
+        gray2,
+        full=True,
+        data_range=255,
+    )
+    diff_map = np.clip((1.0 - similarity_map) * 255.0, 0, 255).astype(np.uint8)
     return float(score), diff_map
 
 
 def hist_correlation(img1: np.ndarray, img2: np.ndarray) -> float:
-    """Корреляция 3D-гистограмм (8x8x8 бинов)."""
+    """Корреляция 3D-гистограмм BGR (8x8x8 бинов)."""
     hist1 = cv2.calcHist([img1], [0, 1, 2], None, [8, 8, 8], [0, 256] * 3)
     hist2 = cv2.calcHist([img2], [0, 1, 2], None, [8, 8, 8], [0, 256] * 3)
     cv2.normalize(hist1, hist1, alpha=1.0, norm_type=cv2.NORM_L1)
@@ -51,120 +79,309 @@ def hist_correlation(img1: np.ndarray, img2: np.ndarray) -> float:
     return float(cv2.compareHist(hist1, hist2, cv2.HISTCMP_CORREL))
 
 
+# ---------- Характеристики изображения ----------
+
+
+def image_stats(img: np.ndarray) -> dict[str, float | int | str]:
+    """Рассчитать компактный набор характеристик изображения."""
+    height, width = img.shape[:2]
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+
+    brightness = float(np.mean(gray))
+    contrast = float(np.std(gray))
+    saturation = float(np.mean(hsv[:, :, 1]))
+    sharpness = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+
+    total = gray.size
+    dark_clip = float(np.count_nonzero(gray <= 2) / total * 100.0)
+    bright_clip = float(np.count_nonzero(gray >= 253) / total * 100.0)
+
+    return {
+        "width": width,
+        "height": height,
+        "aspect_ratio": width / height,
+        "brightness": brightness,
+        "contrast": contrast,
+        "saturation": saturation,
+        "sharpness": sharpness,
+        "dark_clip_pct": dark_clip,
+        "bright_clip_pct": bright_clip,
+    }
+
+
+def format_stats(stats: dict[str, float | int | str]) -> str:
+    """Красивый текстовый вывод характеристик."""
+    return (
+        f"  Размер:               {stats['width']} x {stats['height']}\n"
+        f"  Aspect ratio:         {stats['aspect_ratio']:.4f}\n"
+        f"  Яркость:              {stats['brightness']:.2f}\n"
+        f"  Контраст:             {stats['contrast']:.2f}\n"
+        f"  Насыщенность:         {stats['saturation']:.2f}\n"
+        f"  Резкость (Laplacian): {stats['sharpness']:.2f}\n"
+        f"  Чёрный clipping:      {stats['dark_clip_pct']:.2f}%\n"
+        f"  Белый clipping:       {stats['bright_clip_pct']:.2f}%"
+    )
+
+
+# ---------- Приведение размеров ----------
+
+
+def resize_pair(
+    img1: np.ndarray,
+    img2: np.ndarray,
+    resize_to: str = "first",
+) -> tuple[np.ndarray, np.ndarray] | None:
+    """Привести пару к совместимому размеру для сравнения."""
+    if img1.shape == img2.shape:
+        return img1, img2
+
+    if resize_to == "first":
+        target = (img1.shape[1], img1.shape[0])
+        img2 = cv2.resize(img2, target, interpolation=cv2.INTER_AREA)
+    elif resize_to == "second":
+        target = (img2.shape[1], img2.shape[0])
+        img1 = cv2.resize(img1, target, interpolation=cv2.INTER_AREA)
+    elif resize_to == "min":
+        height = min(img1.shape[0], img2.shape[0])
+        width = min(img1.shape[1], img2.shape[1])
+        img1 = cv2.resize(img1, (width, height), interpolation=cv2.INTER_AREA)
+        img2 = cv2.resize(img2, (width, height), interpolation=cv2.INTER_AREA)
+    else:
+        print("[!] Изображения разных размеров, сравнение невозможно.", file=sys.stderr)
+        return None
+
+    return img1, img2
+
+
 # ---------- Визуализация ----------
 
+
 def make_heatmap(diff_map: np.ndarray) -> np.ndarray:
-    """Раскрашивает карту различий, чтобы было видно, ГДЕ отличаются."""
+    """Раскрасить карту различий."""
     return cv2.applyColorMap(diff_map, cv2.COLORMAP_JET)
 
 
-def side_by_side(img1, img2, diff_map, label_h=30) -> np.ndarray:
-    """Собирает три изображения в одну панель с подписями."""
+def side_by_side(
+    img1: np.ndarray,
+    img2: np.ndarray,
+    diff_map: np.ndarray,
+    label_h: int = 30,
+) -> np.ndarray:
+    """Собрать Image 1 / Image 2 / Difference в одну панель."""
     heat = make_heatmap(diff_map)
 
-    def pad(img):
-        # добавляем сверху полоску для подписи
+    def pad(img: np.ndarray) -> np.ndarray:
         return cv2.copyMakeBorder(
-            img, label_h, 0, 0, 0,
-            cv2.BORDER_CONSTANT, value=(30, 30, 30),
+            img,
+            label_h,
+            0,
+            0,
+            0,
+            cv2.BORDER_CONSTANT,
+            value=(30, 30, 30),
         )
 
-    a, b, c = pad(img1), pad(img2), pad(heat)
+    panels = [pad(img1), pad(img2), pad(heat)]
+    labels = ["Image 1", "Image 2", "Difference (hot = more different)"]
 
-    for img, text in ((a, "Image 1"), (b, "Image 2"), (c, "Difference (hot = more different)")):
-        cv2.putText(img, text, (10, 20),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6,
-                    (255, 255, 255), 1, cv2.LINE_AA)
+    for panel, text in zip(panels, labels):
+        cv2.putText(
+            panel,
+            text,
+            (10, 20),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            (255, 255, 255),
+            1,
+            cv2.LINE_AA,
+        )
 
-    return np.hstack([a, b, c])
+    return np.hstack(panels)
 
 
-# ---------- Основная функция ----------
+# ---------- Вывод результатов ----------
 
-def compare(path1: str, path2: str,
-            show: bool = True,
-            save_diff: str | None = None,
-            resize_to: str = "first") -> dict:
+
+def verdict_from_ssim(ssim_value: float) -> str:
+    """Интерпретация SSIM; это НЕ оценка художественного качества."""
+    if ssim_value > 0.95:
+        return "очень похожи"
+    if ssim_value > 0.80:
+        return "похожи"
+    if ssim_value > 0.50:
+        return "заметно разные"
+    return "сильно разные"
+
+
+def signed_delta(value: float, base: float) -> tuple[float, float]:
+    """Вернуть абсолютную и процентную разницу."""
+    delta = value - base
+    if base == 0:
+        return delta, 0.0
+    return delta, delta / abs(base) * 100.0
+
+
+def visual_stability_score(
+    ssim_value: float,
+    hist_value: float,
+    sharpness_delta_pct: float,
+) -> float:
+    """Сводный индикатор стабильности относительно BASE.
+
+    Это эвристика для сортировки вариантов, а не объективная оценка качества.
+    SSIM имеет основной вес, цветовая гистограмма — меньший, а изменение
+    резкости мягко штрафуется в обе стороны.
     """
-    Сравнивает два изображения.
+    ssim_component = float(np.clip(ssim_value, 0.0, 1.0))
+    hist_component = float(np.clip((hist_value + 1.0) / 2.0, 0.0, 1.0))
+    sharp_component = math.exp(-abs(sharpness_delta_pct) / 100.0)
+    score = 100.0 * (
+        0.60 * ssim_component
+        + 0.25 * hist_component
+        + 0.15 * sharp_component
+    )
+    return float(np.clip(score, 0.0, 100.0))
 
-    resize_to: 'first'  — приводить второе к размеру первого
-               'second' — наоборот
-               'min'    — оба к минимальному общему размеру
-               None     — не менять (тогда при разных размерах будет ошибка SSIM)
+
+def stability_label(score: float) -> str:
+    """Человеческая метка для эвристического stability score."""
+    if score >= 90.0:
+        return "STABLE"
+    if score >= 80.0:
+        return "GOOD"
+    if score >= 70.0:
+        return "WATCH"
+    return "WARNING"
+
+
+def analyse_rank_stability(rows: list[dict]) -> dict:
+    """Найти возможный quality cliff между соседними rank.
+
+    Анализируется только фактически присутствующая серия. Никакие отсутствующие
+    rank не считаются стабильными автоматически.
     """
+    ranked = sorted(
+        (row for row in rows if row.get("rank") is not None),
+        key=lambda row: int(row["rank"]),
+        reverse=True,
+    )
+
+    cliffs: list[dict] = []
+    for high, low in zip(ranked, ranked[1:]):
+        drop = float(high["stability_score"]) - float(low["stability_score"])
+        if drop >= 8.0:
+            cliffs.append({
+                "from_rank": int(high["rank"]),
+                "to_rank": int(low["rank"]),
+                "score_drop": drop,
+            })
+
+    stable_candidates = [
+        row for row in ranked
+        if float(row["stability_score"]) >= 80.0
+    ]
+
+    minimum_stable_rank = None
+    if stable_candidates:
+        minimum_stable_rank = min(int(row["rank"]) for row in stable_candidates)
+
+    return {
+        "cliffs": cliffs,
+        "minimum_stable_rank": minimum_stable_rank,
+    }
+
+
+def compare(
+    path1: str,
+    path2: str,
+    show: bool = True,
+    save_diff: str | None = None,
+    resize_to: str = "first",
+) -> dict:
+    """Сравнить два изображения и вернуть все рассчитанные метрики."""
     img1 = load_image(path1)
     img2 = load_image(path2)
     if img1 is None or img2 is None:
         return {}
 
-    # --- Приведение размеров ---
-    if img1.shape != img2.shape:
-        if resize_to == "first":
-            target = (img1.shape[1], img1.shape[0])
-            img2 = cv2.resize(img2, target, interpolation=cv2.INTER_AREA)
-        elif resize_to == "second":
-            target = (img2.shape[1], img2.shape[0])
-            img1 = cv2.resize(img1, target, interpolation=cv2.INTER_AREA)
-        elif resize_to == "min":
-            h = min(img1.shape[0], img2.shape[0])
-            w = min(img1.shape[1], img2.shape[1])
-            img1 = cv2.resize(img1, (w, h), interpolation=cv2.INTER_AREA)
-            img2 = cv2.resize(img2, (w, h), interpolation=cv2.INTER_AREA)
-        else:
-            print("[!] Изображения разных размеров, SSIM невозможен.", file=sys.stderr)
-            return {}
+    resized = resize_pair(img1, img2, resize_to)
+    if resized is None:
+        return {}
+    img1, img2 = resized
 
-    # --- Градации серого ---
     gray1 = cv2.cvtColor(img1, cv2.COLOR_BGR2GRAY)
     gray2 = cv2.cvtColor(img2, cv2.COLOR_BGR2GRAY)
 
-    # --- Метрики ---
-    mse_val = mse(gray1, gray2)
+    mse_val = gray_mse(gray1, gray2)
+    color_mse_val = mse(img1, img2)
     ssim_val, diff_map = ssim_map(gray1, gray2)
     hist_val = hist_correlation(img1, img2)
 
+    stats1 = image_stats(img1)
+    stats2 = image_stats(img2)
+
+    _, sharp_pct = signed_delta(float(stats2["sharpness"]), float(stats1["sharpness"]))
+    stability = visual_stability_score(ssim_val, hist_val, sharp_pct)
+
     results = {
-        "mse": mse_val,
+        "mse_gray": mse_val,
+        "mse_color": color_mse_val,
         "ssim": ssim_val,
         "hist_correlation": hist_val,
-        "identical": mse_val == 0.0,
+        "stability_score": stability,
+        "identical": bool(np.array_equal(img1, img2)),
+        "stats1": stats1,
+        "stats2": stats2,
     }
 
-    # --- Отчёт ---
-    print("=" * 50)
+    print("=" * 70)
     print(f"  {Path(path1).name}  vs  {Path(path2).name}")
-    print("=" * 50)
-    print(f"  MSE  (меньше = лучше, 0 = идентичны):       {mse_val:12.2f}")
-    print(f"  SSIM (1 = идентичны):                       {ssim_val:12.4f}")
-    print(f"  Корреляция гистограмм (1 = идентичны):      {hist_val:12.4f}")
+    print("=" * 70)
+    print(f"  Gray MSE:                                      {mse_val:12.2f}")
+    print(f"  Color MSE:                                     {color_mse_val:12.2f}")
+    print(f"  SSIM:                                           {ssim_val:12.4f}")
+    print(f"  Корреляция гистограмм:                         {hist_val:12.4f}")
+    print(f"  Visual stability score:                        {stability:12.2f}/100")
+
+    print("\n  Характеристики Image 1:")
+    print(format_stats(stats1))
+    print("\n  Характеристики Image 2:")
+    print(format_stats(stats2))
+
+    print("\n  Изменения Image 2 относительно Image 1:")
+    for key, label in (
+        ("brightness", "Яркость"),
+        ("contrast", "Контраст"),
+        ("saturation", "Насыщенность"),
+        ("sharpness", "Резкость"),
+        ("dark_clip_pct", "Чёрный clipping"),
+        ("bright_clip_pct", "Белый clipping"),
+    ):
+        delta, percent = signed_delta(float(stats2[key]), float(stats1[key]))
+        print(f"  {label:22s}: {delta:+10.2f}  ({percent:+7.2f}%)")
 
     if results["identical"]:
         print("\n  >>> Изображения полностью идентичны <<<")
     else:
-        verdict = (
-            "очень похожи" if ssim_val > 0.95 else
-            "похожи"       if ssim_val > 0.80 else
-            "заметно разные" if ssim_val > 0.50 else
-            "сильно разные"
-        )
-        print(f"\n  Вывод: изображения {verdict} (по SSIM)")
-    print("=" * 50)
+        print(f"\n  Вывод по SSIM: изображения {verdict_from_ssim(ssim_val)}")
+        print("  ⚠ SSIM — метрика сходства, а не универсальная оценка качества.")
+        print("  ℹ Stability score — эвристика для сравнения вариантов, не оценка искусства.")
+    print("=" * 70)
 
-    # --- Сохранение карты различий ---
     if save_diff:
-        cv2.imwrite(save_diff, diff_map)
-        print(f"  Карта различий сохранена: {save_diff}")
+        output = Path(save_diff)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        cv2.imwrite(str(output), diff_map)
+        print(f"  Карта различий сохранена: {output}")
 
-    # --- Показ ---
     if show:
         panel = side_by_side(img1, img2, diff_map)
-        # уменьшаем, если слишком широко для экрана
-        h, w = panel.shape[:2]
-        max_w = 1800
-        if w > max_w:
-            scale = max_w / w
-            panel = cv2.resize(panel, (int(w * scale), int(h * scale)))
+        height, width = panel.shape[:2]
+        max_width = 1800
+        if width > max_width:
+            scale = max_width / width
+            panel = cv2.resize(panel, (int(width * scale), int(height * scale)))
         cv2.imshow("Image comparison (press any key)", panel)
         cv2.waitKey(0)
         cv2.destroyAllWindows()
@@ -172,28 +389,214 @@ def compare(path1: str, path2: str,
     return results
 
 
+# ---------- Пакетный анализ серии ----------
+
+
+IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"}
+
+
+def rank_from_name(path: Path) -> int | None:
+    """Извлечь rank из имени вроде r16, rank16, R16."""
+    match = re.search(r"(?:^|[_ .-])r(?:ank)?[_ .-]?(\d+)(?:$|[_ .-])", path.stem, re.I)
+    if match:
+        return int(match.group(1))
+    return None
+
+
+def is_base_name(path: Path) -> bool:
+    """Определить BASE/reference по имени файла."""
+    return bool(re.search(r"(?:^|[_ . -])base(?:$|[_ . -])", path.stem, re.I))
+
+
+def collect_images(folder: str | Path) -> list[Path]:
+    """Собрать изображения из папки, отсортировав BASE, затем rank по убыванию."""
+    folder_path = Path(folder)
+    if not folder_path.is_dir():
+        print(f"[!] Папка не найдена: {folder}", file=sys.stderr)
+        return []
+
+    paths = [
+        p for p in folder_path.iterdir()
+        if p.is_file() and p.suffix.lower() in IMAGE_EXTENSIONS
+    ]
+
+    def sort_key(path: Path) -> tuple[int, int, str]:
+        if is_base_name(path):
+            return (0, 0, path.name.lower())
+        rank = rank_from_name(path)
+        if rank is not None:
+            return (1, -rank, path.name.lower())
+        return (2, 0, path.name.lower())
+
+    return sorted(paths, key=sort_key)
+
+
+def analyse_series(folder: str | Path, resize_to: str = "first") -> list[dict]:
+    """Сравнить все rank-варианты в папке с BASE."""
+    paths = collect_images(folder)
+    if not paths:
+        return []
+
+    base = next((path for path in paths if is_base_name(path)), paths[0])
+    base_img = load_image(base)
+    if base_img is None:
+        return []
+
+    base_stats = image_stats(base_img)
+    print("=" * 118)
+    print(f"  SERIES ANALYSIS: {Path(folder).resolve()}")
+    print(f"  BASE: {base.name}")
+    print("  Все метрики ниже сравнивают вариант с BASE.")
+    print("=" * 118)
+    print(
+        f"  {'Variant':24s} {'Rank':>5s} {'SSIM':>8s} {'Hist':>8s} "
+        f"{'Sharp Δ':>10s} {'Bright Δ':>10s} {'Contrast Δ':>11s} {'Stable':>9s} {'Flag':>8s}"
+    )
+    print("-" * 118)
+
+    rows: list[dict] = []
+    for path in paths:
+        if path.resolve() == base.resolve():
+            continue
+
+        img = load_image(path)
+        if img is None:
+            continue
+
+        resized = resize_pair(base_img, img, resize_to)
+        if resized is None:
+            continue
+        base_cmp, img_cmp = resized
+
+        gray_base = cv2.cvtColor(base_cmp, cv2.COLOR_BGR2GRAY)
+        gray_img = cv2.cvtColor(img_cmp, cv2.COLOR_BGR2GRAY)
+        ssim_value, _ = ssim_map(gray_base, gray_img)
+        hist_value = hist_correlation(base_cmp, img_cmp)
+        stats = image_stats(img_cmp)
+
+        _, sharp_pct = signed_delta(float(stats["sharpness"]), float(base_stats["sharpness"]))
+        _, bright_pct = signed_delta(float(stats["brightness"]), float(base_stats["brightness"]))
+        _, contrast_pct = signed_delta(float(stats["contrast"]), float(base_stats["contrast"]))
+        stability = visual_stability_score(ssim_value, hist_value, sharp_pct)
+
+        rank = rank_from_name(path)
+        rank_text = str(rank) if rank is not None else "-"
+        label = stability_label(stability)
+        print(
+            f"  {path.stem[:24]:24s} {rank_text:>5s} {ssim_value:8.4f} "
+            f"{hist_value:8.4f} {sharp_pct:+9.2f}% {bright_pct:+9.2f}% "
+            f"{contrast_pct:+10.2f}% {stability:8.2f} {label:>8s}"
+        )
+
+        rows.append({
+            "path": str(path),
+            "name": path.name,
+            "rank": rank,
+            "ssim": ssim_value,
+            "hist_correlation": hist_value,
+            "sharpness_delta_pct": sharp_pct,
+            "brightness_delta_pct": bright_pct,
+            "contrast_delta_pct": contrast_pct,
+            "stability_score": stability,
+            "stability_label": label,
+        })
+
+    analysis = analyse_rank_stability(rows)
+
+    print("-" * 118)
+    if analysis["cliffs"]:
+        print("  ⚠ QUALITY CLIFF: резкое падение stability score между:")
+        for cliff in analysis["cliffs"]:
+            print(
+                f"      r{cliff['from_rank']} → r{cliff['to_rank']}: "
+                f"-{cliff['score_drop']:.2f} points"
+            )
+    else:
+        print("  ✓ Резкого quality cliff среди присутствующих rank не обнаружено.")
+
+    if analysis["minimum_stable_rank"] is not None:
+        print(
+            f"  ★ Минимальный стабильный rank по этой эвристике: "
+            f"r{analysis['minimum_stable_rank']}"
+        )
+    else:
+        print("  ⚠ Ни один присутствующий rank не достиг stability score 80/100.")
+
+    print("  ℹ Stable ≥90, Good ≥80, Watch ≥70; это эвристические пороги.")
+    print("  ℹ SSIM/Hist показывают сходство с BASE; это не рейтинг художественного качества.")
+    print("  ℹ Stability score помогает сортировать варианты, но финальное решение делаем по A/B-картинкам.")
+    print("=" * 118)
+    return rows
+
+
 # ---------- CLI ----------
 
-def main():
-    parser = argparse.ArgumentParser(description="Сравнение двух изображений.")
-    parser.add_argument("image1")
-    parser.add_argument("image2")
-    parser.add_argument("--no-show", action="store_true",
-                        help="не открывать окно (для серверов без GUI)")
-    parser.add_argument("--save-diff", metavar="PATH",
-                        help="сохранить карту различий в файл")
-    parser.add_argument("--resize-to", choices=["first", "second", "min"],
-                        default="first",
-                        help="к какому размеру приводить изображения")
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Анализ и сравнение изображений для тестов Krea2/LoRA/SVD."
+    )
+    subparsers = parser.add_subparsers(dest="command")
+
+    pair = subparsers.add_parser("compare", help="сравнить два изображения")
+    pair.add_argument("image1")
+    pair.add_argument("image2")
+    pair.add_argument("--no-show", action="store_true", help="не открывать окно")
+    pair.add_argument("--save-diff", metavar="PATH", help="сохранить карту различий")
+    pair.add_argument(
+        "--resize-to",
+        choices=["first", "second", "min"],
+        default="first",
+        help="к какому размеру приводить изображения",
+    )
+
+    series = subparsers.add_parser("series", help="сравнить серию изображений с BASE")
+    series.add_argument("folder", help="папка с BASE/rank изображениями")
+    series.add_argument(
+        "--resize-to",
+        choices=["first", "second", "min"],
+        default="first",
+        help="к какому размеру приводить изображения",
+    )
+
+    return parser
+
+
+def main() -> None:
+    parser = build_parser()
     args = parser.parse_args()
 
-    compare(
-        args.image1,
-        args.image2,
-        show=not args.no_show,
-        save_diff=args.save_diff,
-        resize_to=args.resize_to,
-    )
+    # Для обратной совместимости поддерживаем старый синтаксис:
+    # python main.py image1.png image2.png [--no-show ...]
+    if args.command is None and len(sys.argv) >= 3 and not sys.argv[1].startswith("-"):
+        compare_parser = argparse.ArgumentParser(description="Сравнение двух изображений.")
+        compare_parser.add_argument("image1")
+        compare_parser.add_argument("image2")
+        compare_parser.add_argument("--no-show", action="store_true")
+        compare_parser.add_argument("--save-diff", metavar="PATH")
+        compare_parser.add_argument("--resize-to", choices=["first", "second", "min"], default="first")
+        legacy = compare_parser.parse_args()
+        compare(
+            legacy.image1,
+            legacy.image2,
+            show=not legacy.no_show,
+            save_diff=legacy.save_diff,
+            resize_to=legacy.resize_to,
+        )
+        return
+
+    if args.command == "compare":
+        compare(
+            args.image1,
+            args.image2,
+            show=not args.no_show,
+            save_diff=args.save_diff,
+            resize_to=args.resize_to,
+        )
+    elif args.command == "series":
+        analyse_series(args.folder, resize_to=args.resize_to)
+    else:
+        parser.print_help()
 
 
 if __name__ == "__main__":
