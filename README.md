@@ -35,7 +35,7 @@ pip install lpips torch
 
 If `lpips` is not installed, LPIPS is skipped and the remaining metrics are still calculated.
 
-### GPU / CUDA
+### 🛠 GPU / CUDA
 
 LPIPS uses CUDA automatically when a CUDA-enabled PyTorch installation is available. Otherwise it falls back to **CPU**; a GPU is **not required** for the script to run or for LPIPS itself to be calculated.
 
