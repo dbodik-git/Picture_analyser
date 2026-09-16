@@ -46,13 +46,13 @@ For a CUDA setup, install a PyTorch build appropriate for your system from the o
 ### Compare two images
 
 ```bash
-python Picture_analyser_v3_fix.py image1.png image2.png
+python Picture_analyser.py image1.png image2.png
 ```
 
 Do not open the preview window and save the difference heatmap:
 
 ```bash
-python Picture_analyser_v3_fix.py image1.png image2.png --no-show --save-diff diff.png
+python Picture_analyser.py image1.png image2.png --no-show --save-diff diff.png
 ```
 
 The old two-file syntax without the explicit `compare` command is also supported.
@@ -60,13 +60,13 @@ The old two-file syntax without the explicit `compare` command is also supported
 ### Analyze a rank series
 
 ```bash
-python Picture_analyser_v3_fix.py series ./test
+python Picture_analyser.py series ./test
 ```
 
 Limit the number of worker threads:
 
 ```bash
-python Picture_analyser_v3_fix.py series ./test --workers 8
+python Picture_analyser.py series ./test --workers 8
 ```
 
 If the image sizes differ, the comparison can be controlled with:
@@ -189,7 +189,7 @@ r1.png
 run:
 
 ```bash
-python Picture_analyser_v3_fix.py series ./folder
+python Picture_analyser.py series ./folder
 ```
 
 The resulting table lets you see how similarity changes as rank is reduced. A sudden drop in the Stability Score can indicate a possible degradation point, while SSIM / PSNR / LPIPS provide additional independent measurements.
